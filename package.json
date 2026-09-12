@@ -1,0 +1,27 @@
+{
+  "name": "teams-readonly-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only MCP server over your own Microsoft Teams chats. No write tools, read-only OAuth scopes, GET-only.",
+  "type": "module",
+  "bin": {
+    "teams-readonly-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
