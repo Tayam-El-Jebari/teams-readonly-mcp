@@ -21,6 +21,10 @@ function required(name: string, value: string | undefined): string {
   return value;
 }
 
+export function loadFirstNamesOnly(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env['TEAMS_MCP_FIRST_NAMES_ONLY']?.trim().toLowerCase() !== 'false';
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const dir = env['TEAMS_MCP_TOKEN_DIR'] ?? join(homedir(), '.config', 'teams-readonly-mcp');
   return {

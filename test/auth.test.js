@@ -15,7 +15,7 @@ import {
   beginLogin,
   completeLogin,
   credentialFacts,
-  redact,
+  redactSensitiveData,
   scopesFromAccessToken,
 } from '../dist/auth.js';
 import { loadConfig, LEAST_PRIVILEGE_SCOPE } from '../dist/config.js';
@@ -26,30 +26,30 @@ function jwt(claims) {
   return `${b64({ alg: 'none' })}.${b64(claims)}.sig`;
 }
 
-describe('redact', () => {
+describe('redactSensitiveData', () => {
   const SENTINEL_JWT = jwt({ scp: 'Chat.Read', upn: 'x@y.z' });
 
   test('strips a JWT anywhere in a string', () => {
-    const out = redact(`refresh failed for token ${SENTINEL_JWT} at 12:00`);
+    const out = redactSensitiveData(`refresh failed for token ${SENTINEL_JWT} at 12:00`);
     assert.ok(!out.includes(SENTINEL_JWT), 'JWT survived redaction');
     assert.match(out, /\[redacted-jwt\]/);
   });
 
   test('strips token fields from an echoed JSON body', () => {
     const body = '{"access_token":"abc.def.ghi","refresh_token":"0.AAAA-secret","expires_in":3600}';
-    const out = redact(body);
+    const out = redactSensitiveData(body);
     assert.ok(!out.includes('0.AAAA-secret'));
     assert.ok(!out.includes('abc.def.ghi'));
     assert.match(out, /"expires_in":3600/, 'non-secret fields should survive');
   });
 
   test('strips an Authorization header value', () => {
-    assert.equal(redact('Bearer eyJhbGciOi.payload.sig'), 'Bearer [redacted]');
+    assert.equal(redactSensitiveData('Bearer eyJhbGciOi.payload.sig'), 'Bearer [redacted]');
   });
 
   test('leaves an ordinary message untouched', () => {
     const msg = 'not authenticated. Run teams_auth_login first.';
-    assert.equal(redact(msg), msg);
+    assert.equal(redactSensitiveData(msg), msg);
   });
 });
 
