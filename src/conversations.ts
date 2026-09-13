@@ -68,7 +68,7 @@ const GraphChat = z.object({
 });
 
 const Identity = z.object({ displayName: z.string().nullish() });
-const GraphMessage = z.object({
+export const GraphMessage = z.object({
   id: z.string(),
   messageType: z.string().optional(),
   createdDateTime: Timestamp,
@@ -107,7 +107,7 @@ export function messagesUrl(chatId: string, since?: string): string {
   return graphUrl(`/chats/${encodeURIComponent(chatId)}/messages`, query);
 }
 
-function formatDisplayName(name: string, firstNamesOnly: boolean): string {
+export function formatDisplayName(name: string, firstNamesOnly: boolean): string {
   const trimmed = name.trim();
   // Extract first word when privacy mode enabled; this respects common given-name conventions but is not guaranteed.
   return (firstNamesOnly ? trimmed.split(/\s+/)[0] ?? '' : trimmed).slice(0, 150);

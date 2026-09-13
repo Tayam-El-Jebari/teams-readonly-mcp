@@ -3,6 +3,14 @@ const REQUEST_SPACING_MS = 1250; // Minimum spacing per endpoint
 const GLOBAL_REQUEST_SPACING_MS = 65; // Minimum spacing across all endpoints
 const MAX_RETRIES = 3;
 const MAX_RETRY_WAIT_MS = 120_000;
+const ALLOWED_PATHS = {
+  chats: /^\/v1\.0\/me\/chats$/,
+  joinedTeams: /^\/v1\.0\/me\/joinedTeams$/,
+  chatMessages: /^\/v1\.0\/chats\/[^/]+\/messages$/,
+  channels: /^\/v1\.0\/teams\/[^/]+\/channels$/,
+  channelMessages: /^\/v1\.0\/teams\/[^/]+\/channels\/[^/]+\/messages$/,
+  channelReplies: /^\/v1\.0\/teams\/[^/]+\/channels\/[^/]+\/messages\/[^/]+\/replies$/,
+};
 
 interface GraphDependencies {
   fetch: typeof fetch;
@@ -20,16 +28,20 @@ function validateGraphUrl(address: string): URL {
   const url = new URL(address);
   if (
     url.origin !== 'https://graph.microsoft.com' || url.username || url.password || url.hash ||
-    !/^\/v1\.0\/(?:me\/chats|chats\/[^/]+\/messages)$/.test(url.pathname)
+    !Object.values(ALLOWED_PATHS).some((pattern) => pattern.test(url.pathname))
   ) {
     throw new Error('Refused an unexpected Graph URL. No credential was sent.');
   }
   return url;
 }
 
+function normalizePath(pathname: string): string {
+  return pathname.split('/').map((segment) => encodeURIComponent(decodeURIComponent(segment))).join('/');
+}
+
 export function validateNextLink(address: string, previousAddress: string): string {
   const next = validateGraphUrl(address);
-  if (next.pathname !== validateGraphUrl(previousAddress).pathname) {
+  if (normalizePath(next.pathname) !== normalizePath(validateGraphUrl(previousAddress).pathname)) {
     throw new Error('Graph pagination changed the requested resource; read stopped.');
   }
   return next.toString();
@@ -107,6 +119,12 @@ export class GraphClient {
           throw new Error('Graph rejected the credential. Run teams_auth_login to sign in again.');
         }
         if (response.status === 403) {
+          if (url.pathname.startsWith('/v1.0/teams/') && url.pathname.includes('/messages')) {
+            throw new Error('Channel read denied. An admin must consent to ChannelMessage.Read.All. Add that scope to TEAMS_MCP_SCOPE and sign in again; also check channel membership.');
+          }
+          if (url.pathname.includes('/joinedTeams') || url.pathname.startsWith('/v1.0/teams/')) {
+            throw new Error('Channel listing denied. Check Team.ReadBasic.All and Channel.ReadBasic.All consent and team membership.');
+          }
           throw new Error('Graph denied this read. Check Chat.Read consent and access to the conversation.');
         }
         if (response.status === 404) throw new Error('Conversation not found or no longer accessible.');
