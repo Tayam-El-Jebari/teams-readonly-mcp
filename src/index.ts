@@ -1,45 +1,64 @@
 #!/usr/bin/env node
-/**
- * teams-readonly-mcp · read-only MCP server over my own Microsoft Teams chats.
- *
- * Gate 1 scaffolding: transport, one tool, no credential, no Graph calls.
- * The full tool surface and the gate sequence live in ../plan.md.
- *
- * Two invariants hold for every tool added to this file:
- *   1. No write tools. There is no Graph call here with a method other than GET,
- *      and no tool that mutates anything. See plan.md section 5.
- *   2. Token material never crosses the tool boundary. Tools report facts about
- *      the credential, never the credential.
- */
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod';
+import { loadConfig } from './config.js';
+import {
+  beginLogin,
+  completeLogin,
+  credentialFacts,
+  redactSensitiveData,
+  tokenFileMode,
+  type PendingLogin,
+} from './auth.js';
 
 const NAME = 'teams-readonly-mcp';
 const VERSION = '0.1.0';
 
-/**
- * What the server is willing to say about the stored credential. Deliberately
- * describes the token rather than carrying it: no access_token, no
- * refresh_token, no Authorization header is representable in this shape.
- */
+// Annotations advise clients; they do not enforce permissions.
+const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
+
+async function guarded<T>(
+  work: () => Promise<T>,
+  shape: (value: T) => { text: string; data: unknown },
+) {
+  try {
+    const { text, data } = shape(await work());
+    return { content: [{ type: 'text' as const, text }], structuredContent: data };
+  } catch (error) {
+    // Tool failures must be results, not protocol errors, so clients can recover.
+    const message = error instanceof Error ? error.message : String(error);
+    return { content: [{ type: 'text' as const, text: redactSensitiveData(message) }], isError: true };
+  }
+}
+
 const AuthStatus = z.object({
   authenticated: z.boolean(),
-  // Optional, not nullable. Both z.string().nullable() and
-  // z.union([z.string(), z.null()]) serialize to type: ["string","null"], and
-  // several MCP clients read `type` as a single string and either reject the
-  // tool or silently drop the constraint. Absence carries the same meaning here
-  // because `authenticated` is the flag, so an optional single-typed property is
-  // both portable and a cleaner contract.
-  account: z
-    .string()
-    .optional()
-    .describe('UPN of the signed-in user. Absent when no credential is stored'),
-  scopes: z.array(z.string()).describe('Scopes granted to the stored access token'),
+  account: z.string().optional().describe('UPN of the signed-in user. Absent when not signed in'),
+  scopes: z.array(z.string()).describe('Scopes actually granted to the stored access token'),
+  expiresAt: z.string().optional().describe('ISO access-token expiry. Absent when not signed in'),
+  refreshDue: z.boolean().describe('True when the next read will refresh the token first'),
+  signInPending: z.boolean().describe('True when a device-code sign-in is awaiting the user'),
+  tokenFileMode: z.string().optional().describe('Octal permissions of the token file, e.g. 600'),
   detail: z.string().describe('What to do next, in one sentence'),
 });
 
+const LoginStarted = z.object({
+  verificationUri: z.string().describe('Open this in a browser'),
+  userCode: z.string().describe('Enter this code at the verification URI'),
+  expiresAt: z.string().describe('ISO time after which this code is dead'),
+  detail: z.string(),
+});
+
+const LoginResult = z.object({
+  authenticated: z.boolean(),
+  account: z.string().optional(),
+  scopes: z.array(z.string()),
+  detail: z.string(),
+});
+
 function createServer(): McpServer {
+  let pending: PendingLogin | undefined;
   const server = new McpServer({ name: NAME, version: VERSION }, { capabilities: { tools: {} } });
 
   server.registerTool(
@@ -48,48 +67,119 @@ function createServer(): McpServer {
       title: 'Teams auth status',
       description:
         'Report whether a Microsoft Graph credential is stored and what it is allowed to read. ' +
-        'Call this before any other tool: it is the precondition check, and it is what a ' +
-        'scheduled briefing should use to decide whether to proceed or fail loudly. ' +
-        'Returns facts about the token (account, granted scopes) and never the token itself. ' +
-        'Does not trigger a login. If it reports unauthenticated, run teams_auth_login.',
+        'Call this first: it is the precondition check, and a scheduled briefing should use it to ' +
+        'decide whether to proceed or fail loudly rather than inventing content. ' +
+        'Returns facts about the token (account, granted scopes, expiry) and never the token. ' +
+        'Touches no network and never starts a sign-in.',
       outputSchema: AuthStatus,
-      // Advisory only: the spec tells clients to distrust annotations and the SDK
-      // never gates on them. Set explicitly anyway, because the defaults are
-      // pessimistic (destructiveHint and openWorldHint both default to true) and
-      // readOnlyHint is what lets a host auto-approve without a prompt.
-      // destructiveHint and idempotentHint are meaningful only when readOnlyHint
-      // is false, so they are omitted.
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: READ_ONLY,
     },
-    () => {
-      // Gate 1 has no credential store. Gate 2 replaces this with a real read.
-      const status: z.infer<typeof AuthStatus> = {
-        authenticated: false,
-        scopes: [],
-        detail:
-          'No credential store yet (Gate 1 scaffolding). Gate 2 implements login and token storage.',
-      };
-      return {
-        // Both shapes: structuredContent for callers that can use it, serialized
-        // JSON in a text block for backwards compatibility, as the spec asks.
-        content: [{ type: 'text' as const, text: JSON.stringify(status, null, 2) }],
-        structuredContent: status,
-      };
+    () =>
+      guarded(
+        async () => {
+          // Resolve inside the handler so configuration errors do not prevent startup.
+          const cfg = loadConfig();
+          return { facts: await credentialFacts(cfg), mode: await tokenFileMode(cfg) };
+        },
+        ({ facts, mode }) => {
+          const data = {
+            ...facts,
+            signInPending: pending !== undefined && pending.expiresAtEpochMs > Date.now(),
+            ...(mode ? { tokenFileMode: mode } : {}),
+          };
+          return { text: JSON.stringify(data, null, 2), data };
+        },
+      ),
+  );
+
+  server.registerTool(
+    'teams_auth_login',
+    {
+      title: 'Start Teams sign-in',
+      description:
+        'Begin an interactive device-code sign-in and return the URL and code for the user to ' +
+        'enter. Requires a human, so never call this from an unattended or scheduled run: call ' +
+        'teams_auth_status instead and fail if it reports unauthenticated. ' +
+        'This only starts the flow; call teams_auth_complete afterwards to finish it. ' +
+        'Acquires nothing by itself and returns no token material.',
+      outputSchema: LoginStarted,
+      // Sign-in requires a human even though it does not modify Teams data.
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
+    () =>
+      guarded(
+        async () => {
+          pending = await beginLogin(loadConfig());
+          return pending;
+        },
+        (login) => {
+          const expiresAt = new Date(login.expiresAtEpochMs).toISOString();
+          const data = {
+            verificationUri: login.verificationUri,
+            userCode: login.userCode,
+            expiresAt,
+            detail:
+              `Open ${login.verificationUri}, enter code ${login.userCode}, and sign in. ` +
+              `Then call teams_auth_complete. The code dies at ${expiresAt}.`,
+          };
+          return { text: data.detail, data };
+        },
+      ),
+  );
+
+  server.registerTool(
+    'teams_auth_complete',
+    {
+      title: 'Finish Teams sign-in',
+      description:
+        'Wait for the user to finish the sign-in started by teams_auth_login, then store the ' +
+        'credential. Returns the granted scopes so you can confirm the token is read-only. ' +
+        'If it reports the sign-in still pending, the user has not finished; call it again. ' +
+        'Returns no token material.',
+      inputSchema: z.object({
+        waitSeconds: z
+          .number()
+          .int()
+          .min(5)
+          .max(600)
+          .default(120)
+          .describe('How long to wait for the user before returning so you can ask again'),
+      }),
+      outputSchema: LoginResult,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    ({ waitSeconds }) =>
+      guarded(
+        async () => {
+          if (!pending) throw new Error('no sign-in in progress. Call teams_auth_login first.');
+          if (pending.expiresAtEpochMs <= Date.now()) {
+            pending = undefined;
+            throw new Error('the device code expired. Call teams_auth_login to start again.');
+          }
+          const result = await completeLogin(loadConfig(), pending, waitSeconds * 1000);
+          if (result.done) pending = undefined;
+          return result;
+        },
+        (result) => {
+          const data = result.done
+            ? {
+                authenticated: true,
+                ...(result.facts.account ? { account: result.facts.account } : {}),
+                scopes: result.facts.scopes,
+                detail: `Signed in. ${result.facts.scopes.length} scopes granted.`,
+              }
+            : { authenticated: false, scopes: [] as string[], detail: result.detail };
+          return { text: data.detail, data };
+        },
+      ),
   );
 
   return server;
 }
 
-// legacy defaults to 'serve', which pins a 2025-era instance from the same
-// factory when a client opens with the old initialize handshake. Claude's
-// negotiated revision over stdio is undocumented, so serving both eras is free
-// insurance. Do not set legacy: 'reject'.
 serveStdio(createServer, {
-  onerror: (error: Error) => console.error(`[${NAME}] transport error: ${error.message}`),
+  onerror: (error: Error) => console.error(`[${NAME}] transport error: ${redactSensitiveData(error.message)}`),
 });
 
-// stdout carries JSON-RPC and nothing else: a single console.log here corrupts
-// the stream. Diagnostics go to stderr, which Claude Desktop captures to
-// ~/Library/Logs/Claude/mcp-server-<NAME>.log.
+// stdout is reserved for JSON-RPC; diagnostics must go to stderr.
 console.error(`[${NAME}] ${VERSION} listening on stdio`);
