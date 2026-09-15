@@ -1,8 +1,10 @@
 import { convert } from 'html-to-text';
 import * as z from 'zod';
 import { GraphClient, graphUrl, validateNextLink } from './graph.js';
+import type { NameMode } from './config.js';
 
 const MAX_PAGES = 20;
+const CONCISE_MEMBER_LIMIT = 5;
 const MAX_OUTPUT_CHARACTERS = 20_000;
 const ResponseFormat = z.enum(['concise', 'detailed']).default('concise');
 const Timestamp = z.iso.datetime({ offset: true });
@@ -25,7 +27,9 @@ const Conversation = z.object({
   id: z.string(),
   name: z.string(),
   type: z.string(),
-  members: z.array(z.string()),
+  members: z.array(z.string()).describe('Member-name preview in concise mode; do not treat its length as the membership total.'),
+  memberCount: z.number().int().nonnegative().describe('Number of members returned by Graph before concise clipping, not a verified total membership.'),
+  membersTruncated: z.boolean().describe('True when this server clipped the returned member names. False does not guarantee Graph returned a complete roster.'),
   lastActivityAt: z.string().optional(),
   webUrl: z.string().optional(),
 });
@@ -107,13 +111,16 @@ export function messagesUrl(chatId: string, since?: string): string {
   return graphUrl(`/chats/${encodeURIComponent(chatId)}/messages`, query);
 }
 
-export function formatDisplayName(name: string, firstNamesOnly: boolean): string {
+export function formatDisplayName(name: string, mode: NameMode | boolean): string {
   const trimmed = name.trim();
-  // Extract first word when privacy mode enabled; this respects common given-name conventions but is not guaranteed.
-  return (firstNamesOnly ? trimmed.split(/\s+/)[0] ?? '' : trimmed).slice(0, 150);
+  if (mode === false || mode === 'full') return trimmed.slice(0, 150);
+  const [firstName = '', ...remainingNames] = trimmed.split(/\s+/);
+  if (mode === true || mode === 'first-name') return firstName.slice(0, 150);
+  const initials = remainingNames.map((part) => `${Array.from(part)[0]?.toLowerCase() ?? ''}.`);
+  return [firstName, ...initials].join(' ').slice(0, 150);
 }
 
-export function messageText(message: z.infer<typeof GraphMessage>, firstNamesOnly = true): string {
+export function messageText(message: z.infer<typeof GraphMessage>, firstNamesOnly: NameMode | boolean = true): string {
   if (!message.body) return '';
   if (message.body.contentType === 'text') return message.body.content;
   const mentions = new Map(message.mentions.map((mention) => [String(mention.id), mention.mentionText]));
@@ -129,7 +136,7 @@ export function messageText(message: z.infer<typeof GraphMessage>, firstNamesOnl
       teamsMention(element, walk, builder) {
         const name = mentions.get(element.attribs['id'] ?? '');
         if (name !== undefined) builder.addInline(`@${formatDisplayName(name, firstNamesOnly) || 'Unknown'}`);
-        else if (firstNamesOnly) builder.addInline('@Unknown');
+        else if (firstNamesOnly !== false && firstNamesOnly !== 'full') builder.addInline('@Unknown');
         else walk(element.children, builder);
       },
     },
@@ -139,7 +146,7 @@ export function messageText(message: z.infer<typeof GraphMessage>, firstNamesOnl
 function conversationFrom(
   chat: z.infer<typeof GraphChat>,
   detailed: boolean,
-  firstNamesOnly: boolean,
+  firstNamesOnly: NameMode | boolean,
 ): z.infer<typeof Conversation> {
   const members = chat.members.map((member) =>
     formatDisplayName(member.displayName ?? '', firstNamesOnly) || 'Unknown member');
@@ -154,7 +161,9 @@ function conversationFrom(
     id: chat.id,
     name: (chat.topic || members.join(', ') || chat.id).slice(0, 500),
     type: chat.chatType,
-    members,
+    members: detailed ? members : members.slice(0, CONCISE_MEMBER_LIMIT),
+    memberCount: members.length,
+    membersTruncated: !detailed && members.length > CONCISE_MEMBER_LIMIT,
     ...(lastActivityAt ? { lastActivityAt } : {}),
     ...(detailed && chat.webUrl ? { webUrl: chat.webUrl } : {}),
   };
@@ -163,23 +172,30 @@ function conversationFrom(
 export class Conversations {
   constructor(
     private readonly graph: GraphClient,
-    private readonly firstNamesOnly = true,
+    private readonly firstNamesOnly: NameMode | boolean = true,
   ) {}
 
-  async list(input: z.input<typeof ListConversationsInput> = {}): Promise<z.infer<typeof ListConversationsOutput>> {
-    const options = ListConversationsInput.parse(input);
-    const conversations: z.infer<typeof Conversation>[] = [];
+  private async *chatPages() {
     const visitedPages = new Set<string>();
-    const seenChatIds = new Set<string>();
     let url: string | undefined = graphUrl('/me/chats', {
       '$top': '50', '$expand': 'members,lastMessagePreview',
     });
-    let outputCharacters = 0;
     for (let pageNumber = 0; url && pageNumber < MAX_PAGES; pageNumber++) {
       if (visitedPages.has(url)) throw new Error('Graph repeated a pagination link; read stopped.');
       visitedPages.add(url);
       const page: GraphPage<z.infer<typeof GraphChat>> = parsePage(await this.graph.get(url), GraphChat);
-      for (const chat of page.value) {
+      url = page['@odata.nextLink'] ? validateNextLink(page['@odata.nextLink'], url) : undefined;
+      yield { chats: page.value, hitPageLimit: pageNumber === MAX_PAGES - 1 && url !== undefined };
+    }
+  }
+
+  async list(input: z.input<typeof ListConversationsInput> = {}): Promise<z.infer<typeof ListConversationsOutput>> {
+    const options = ListConversationsInput.parse(input);
+    const conversations: z.infer<typeof Conversation>[] = [];
+    const seenChatIds = new Set<string>();
+    let outputCharacters = 0;
+    for await (const page of this.chatPages()) {
+      for (const chat of page.chats) {
         if (seenChatIds.has(chat.id)) continue;
         seenChatIds.add(chat.id);
         if (options.types && !options.types.some((type) => type === chat.chatType)) continue;
@@ -188,32 +204,45 @@ export class Conversations {
           Date.parse(conversation.lastActivityAt) <= Date.parse(options.activeSince)) continue;
         outputCharacters += JSON.stringify(conversation).length;
         if (outputCharacters > MAX_OUTPUT_CHARACTERS) {
-          return { conversations, truncated: true, detail: 'Output limit reached. Narrow activeSince or types.' };
+          return { conversations, truncated: true, detail: 'Partial conversation list: output limit reached. Omitted chats may have activity. Narrow activeSince or types; name lookup searches independently.' };
         }
         conversations.push(conversation);
       }
-      url = page['@odata.nextLink'] ? validateNextLink(page['@odata.nextLink'], url) : undefined;
+      if (page.hitPageLimit) {
+        return { conversations, truncated: true, detail: 'Partial conversation list: page limit reached. Omitted chats may have activity.' };
+      }
     }
-    const hitPageLimit = url !== undefined;
     return {
       conversations,
-      truncated: hitPageLimit,
-      detail: hitPageLimit ? 'Page limit reached; conversation list is incomplete.' : 'All matching conversations returned.',
+      truncated: false,
+      detail: 'All matching conversations returned.',
     };
   }
 
   private async resolve(chat: string): Promise<{ id: string; name: string }> {
     // If input looks like a Teams chat ID (starts with 19:), use it directly.
     if (chat.startsWith('19:')) return { id: chat, name: chat };
-    const result = await this.list();
-    if (result.truncated) {
-      throw new Error('Conversation list is incomplete. Supply a conversation ID instead of a name.');
-    }
     const query = chat.toLocaleLowerCase();
-    const exact = result.conversations.filter((conversation) =>
-      conversation.id === chat || conversation.name.toLocaleLowerCase() === query);
-    const matches = exact.length > 0 ? exact : result.conversations.filter((conversation) =>
-      conversation.name.toLocaleLowerCase().includes(query));
+    const exact: { id: string; name: string }[] = [];
+    const partial: { id: string; name: string }[] = [];
+    const seenChatIds = new Set<string>();
+    for await (const page of this.chatPages()) {
+      for (const entry of page.chats) {
+        if (seenChatIds.has(entry.id)) continue;
+        seenChatIds.add(entry.id);
+        const { id, name } = conversationFrom(entry, false, this.firstNamesOnly);
+        const normalizedName = name.toLocaleLowerCase();
+        if (id === chat || normalizedName === query) {
+          if (exact.length < 2) exact.push({ id, name });
+        } else if (normalizedName.includes(query)) {
+          if (partial.length < 2) partial.push({ id, name });
+        }
+      }
+      if (page.hitPageLimit) {
+        throw new Error('Conversation lookup is partial: the 20-page search limit was reached. A unique match cannot be confirmed. Supply a conversation ID; this does not mean the chat is empty or inactive.');
+      }
+    }
+    const matches = exact.length > 0 ? exact : partial;
     const match = matches[0];
     if (!match) throw new Error('No matching conversation. Use teams_list_conversations to find its ID.');
     if (matches.length > 1) {

@@ -25,6 +25,20 @@ export function loadFirstNamesOnly(env: NodeJS.ProcessEnv = process.env): boolea
   return env['TEAMS_MCP_FIRST_NAMES_ONLY']?.trim().toLowerCase() !== 'false';
 }
 
+export type NameMode = 'initials' | 'first-name' | 'full';
+
+export function loadNameMode(env: NodeJS.ProcessEnv = process.env): NameMode {
+  const mode = env['TEAMS_MCP_NAME_MODE']?.trim().toLowerCase();
+  if (mode !== undefined) {
+    if (mode === 'initials' || mode === 'first-name' || mode === 'full') return mode;
+    throw new Error('TEAMS_MCP_NAME_MODE must be initials, first-name, or full.');
+  }
+  if (env['TEAMS_MCP_FIRST_NAMES_ONLY'] !== undefined) {
+    return loadFirstNamesOnly(env) ? 'first-name' : 'full';
+  }
+  return 'initials';
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const dir = env['TEAMS_MCP_TOKEN_DIR'] ?? join(homedir(), '.config', 'teams-readonly-mcp');
   return {

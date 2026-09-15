@@ -2,7 +2,7 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod';
-import { loadConfig, loadFirstNamesOnly } from './config.js';
+import { loadConfig, loadNameMode } from './config.js';
 import { GraphClient } from './graph.js';
 import { sweep, SweepInput, SweepOutput } from './sweep.js';
 import { Channels, ListChannelsOutput, ReadChannelInput, ReadChannelOutput } from './channels.js';
@@ -71,8 +71,9 @@ const LoginResult = z.object({
 function createServer(): McpServer {
   let pending: PendingLogin | undefined;
   const graph = new GraphClient(() => accessTokenForRead(loadConfig()));
-  const conversations = new Conversations(graph, loadFirstNamesOnly());
-  const channels = new Channels(graph, loadFirstNamesOnly());
+  const nameMode = loadNameMode();
+  const conversations = new Conversations(graph, nameMode);
+  const channels = new Channels(graph, nameMode);
   const server = new McpServer({ name: NAME, version: VERSION }, { capabilities: { tools: {} } });
 
   server.registerTool(
@@ -193,9 +194,11 @@ function createServer(): McpServer {
     {
       title: 'List Teams conversations',
       description:
-        'List your Teams chats with IDs, names, members, and last activity. ' +
+        'List your Teams chats with IDs, names, and last activity. ' +
+        'Concise includes up to five member names; membersTruncated indicates preview clipping. ' +
+        'memberCount counts members returned by Graph, not a verified membership total. Detailed includes all returned member names. ' +
         'Optionally restrict activity and chat types. Use IDs to disambiguate names. ' +
-        'Check truncated before treating the result as complete. Never starts sign-in.',
+        'Check truncated before treating the result as complete; omitted chats may have activity. Never starts sign-in.',
       inputSchema: ListConversationsInput,
       outputSchema: ListConversationsOutput,
       annotations: READ_ONLY,
@@ -212,6 +215,7 @@ function createServer(): McpServer {
       title: 'Read a Teams conversation',
       description:
         'Read a chat by ID or unambiguous name, newest modified first. ' +
+        'Name lookup searches up to 20 chat pages independently of listing output limits. An unreachable chat is not an empty chat. ' +
         'Since filters last modification time, including edits to older messages. ' +
         'Concise returns bounded text; detailed also includes IDs and links. ' +
         'Check truncated and bodyTruncated before treating the result as complete. ' +

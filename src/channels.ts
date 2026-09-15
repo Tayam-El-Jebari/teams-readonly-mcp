@@ -1,5 +1,6 @@
 import * as z from 'zod';
 import { GraphClient, graphUrl, validateNextLink } from './graph.js';
+import type { NameMode } from './config.js';
 import { formatDisplayName, GraphMessage, messageText, ReadConversationInput } from './conversations.js';
 
 const MAX_REQUESTS = 20;
@@ -50,7 +51,7 @@ interface ReadBudget {
 }
 
 export class Channels {
-  constructor(private readonly graph: GraphClient, private readonly firstNamesOnly = true) {}
+  constructor(private readonly graph: GraphClient, private readonly firstNamesOnly: NameMode | boolean = true) {}
 
   private async *pages<Schema extends z.ZodType>(
     address: string, item: Schema, budget: ReadBudget,
