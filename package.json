@@ -10,8 +10,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "inspect": "npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
-    "test": "node --test test/*.test.js"
+    "inspect": "pnpm dlx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
+    "test": "node --test test/*.test.js",
+    "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
@@ -25,5 +26,22 @@
   },
   "engines": {
     "node": ">=20.19.0"
-  }
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tayam-El-Jebari/teams-readonly-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "microsoft-teams",
+    "microsoft-graph",
+    "read-only",
+    "claude"
+  ]
 }

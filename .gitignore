@@ -4,3 +4,6 @@ dist/
 .env
 .env.*
 .DS_Store
+
+# Internal design doc: contains tenant IDs and colleague names.
+plan.md
